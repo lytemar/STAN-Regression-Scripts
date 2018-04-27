@@ -1,0 +1,330 @@
+##################
+# Helper functions
+##################
+
+# Thin a dataset that has replications
+thinDataSet <- function(df, repKey, numRepsToKeep=1) {
+# repKey is the column name that has the repeated number of the Test ID that
+# indicates a replication
+# Return a thinned data frame with numer of reps to keep (numRepsToKeep)
+  require(plyr)
+  require(dplyr)
+  TestRunIDs = unique(df[[repKey]])
+  dfResult <- data.frame()
+  for(i in 1:length(TestRunIDs)){
+    dfTemp <- df[df[[repKey]] == TestRunIDs[i],]
+    dfTemp <- dplyr::sample_n(dfTemp, numRepsToKeep)
+    dfResult <- rbind(dfResult, dfTemp)
+  }
+  return(dfResult)
+}
+
+# Read in multi-sheet xlsx workbooks
+readMultiXlsx <- function(file){
+  sheets <- openxlsx::getSheetNames(file)
+  sheetList <- lapply(sheets, openxlsx::read.xlsx, xlsxFile=file)
+  names(sheetList) <- sheets
+  return(sheetList)
+}
+
+########### Generate polynomial formula names
+# Get the name of the polynomial formula
+formName <- function(order=2) {
+  if (order == 1) {result <- "Linear"}
+  else if (order == 2) {result <- "Quadratic"}
+  else if (order == 3) {result <- "Cubic"}
+  else if (order == 4) {result <- "Quartic"}
+  else if (order == 5) {result <- "Quintic"}
+  else if (order == 6) {result <- "Sextic"}
+  else if (order == 7) {result <- "Septic"}
+  return(result)
+}
+
+
+# Convert the column names in a model matrix to X variable names
+convXColNames <- function(cnames){
+  # Convert the column names of a model matrix that has #.#.#.#... format to
+  # X1^# * X2^# * ...  format
+  newColNames <- rep("", length(cnames))
+  for (i in 1:length(cnames)){
+    col <- strsplit(cnames[i], ".", fixed=TRUE)[[1]]
+    for (j in 1:length(col)) {
+      if (col[j] != "0") {
+		    if (col[j] == "1")	{
+		      newColNames[i] = paste0(newColNames[i],"X",j," ")
+		    }
+		    else {
+			    newColNames[i] = paste0(newColNames[i],"X",j,"^",col[j]," ")
+		    }
+      }
+    }
+    newColNames[i] <- trimws(newColNames[i], "both")  # trime beg or end whitespace
+  }
+  return(newColNames)
+}
+
+# Generate polynomial model matrix up to order
+genModelMatrix <- function(df, order) {
+  # Returns a model matrix up to the requested polynomial order
+  Xs <- colnames(df)[!grepl("Y", names(df))] # X columns of the data
+  X <- do.call(polym,c(as.list(df[, Xs]),degree=order, raw=TRUE))
+  cnames <- colnames(X)
+  cnames <- convXColNames(cnames)
+  colnames(X) <- cnames
+  X <- cbind(1, X)
+  colnames(X)[1] <- "1"
+  return(X)
+}
+
+# Function to get the modes of the betas
+get.Modes <- function(file_dir, dat, param) {
+  # Return the modes and save plots for each KDE
+  # dat:  array of extracted posterior samples
+  # param:  name of posterior variable to sample
+  
+  library(modeest)
+  
+  # Create subdirectory for pics 
+  pic_file_chunk <- paste0(file_dir, param)
+  print(paste("Working on", pic_file_chunk))
+  
+  if (length(dim(dat[[param]])) == 1) {
+    M <- mlv(dat[[param]], method = "Parzen")
+    result <- M$M
+    png(filename = paste0(pic_file_chunk, ".png"))
+    plot(density(dat[[param]]))
+    abline(v=result)
+    dev.off()
+  }
+  else if (length(dim(dat[[param]])) == 2) {
+    result <- rep(NA, dim(dat[[param]])[2])
+    for (i in 1:dim(dat[[param]])[2]) {
+      M <- mlv(dat[[param]][,i], method = "Parzen")
+      result[i] <- M$M
+      png(filename = paste0(pic_file_chunk,"[", i ,"].png"))
+      plot(density(dat[[param]][,i]))
+      abline(v=result[i])
+      dev.off()
+    }
+  }
+  else if (length(dim(dat[[param]])) == 3) {
+    result <- matrix(data=NA_real_,
+                     nrow=dim(dat[[param]])[2],
+                     ncol=dim(dat[[param]])[3])
+    for (i in 1:dim(dat[[param]])[2]) {
+      for (j in 1:dim(dat[[param]])[3]) {
+        M <- mlv(dat[[param]][,i, j], method = "Parzen")
+        result[i, j] <- M$M
+        png(filename = paste0(pic_file_chunk,"[", i ,",", j, "].png"))
+        plot(density(dat[[param]][,i, j]))
+        abline(v=result[i, j])
+        dev.off()
+      }
+    }
+    result <- t(result)
+  }
+  return(result)
+}
+
+# Wrapper function to fit a Stan model
+fit_stan_model <- function(..., # variables to pass to various functions
+                           stan_file, # stan model file path
+                           prefix, # file name prefix
+                           df, # data frame to analyze with cols Y, X1,...
+                           params=list(), # extra parameters to pass to Stan
+                           X_mats=NULL, # list of special model matrices
+                           orders=1:4, # orders of polynomial fit
+                           fit_pars = c("beta", "sigma"), # fit summary params
+                           iter = 2000 # Number of iterations per chain
+                           ) {
+ 
+  # return a list that contains the desire results
+  library(ggplot2)
+  library(bayesplot)
+  library(plyr)
+  
+  # list that contains the Stan model fit, LOOCV metrics, and plots for each
+  # each model generated by formula
+  model_results <- list()
+  
+  fits <- list() # list that contains the stan model fits
+  loo_vals <- list() # list that contains the LOOCV metrics
+  plots <- list() # list that contains the posterior predictive check plots
+  
+  if(is.null(X_mats)) {
+    X <- list()  # list of model matrices
+    Xs <- colnames(df)[!grepl("Y", names(df))] # X columns of the data
+  }
+  else {
+    X <- X_mats
+  }
+  N <- length(df$Y) # Number of observations
+  
+  # Set up the vector for the number of iterations and warmup
+  if (length(iter)==1) {iters <- rep(iter, length(orders))}
+  else {iters <- iter}
+  warmup = ceiling(iters/2)
+  
+  # Create subdirectory for all results
+  dir.create(file.path(".", prefix), showWarnings = FALSE)
+  out_summary_dir <- paste0("./", prefix, "/")
+  # File name prefix for summary files
+  sum_file_prefix <- paste0(out_summary_dir, prefix)
+
+  for (i in 1:length(orders)) { # Fit polynomial models up to spec'd order
+    # Create subdirectory for results
+    out_subdir <- formName(orders[i])
+    dir.create(file.path(out_summary_dir, out_subdir), showWarnings = FALSE)
+    
+    # Create a file name prefix for all results
+    full_prefix <- paste0(out_summary_dir, out_subdir, "/") 
+    
+    # Create a subdriectory and prefix for kernel density esitmate pix
+    kde_pix_subdir <- "KDE"
+    dir.create(file.path(full_prefix, kde_pix_subdir), showWarnings = FALSE)
+    kde_pix_prefix <- paste0(full_prefix, kde_pix_subdir, "/")
+    
+    # file path of output file
+    fit_out_file = paste0(full_prefix, "order_", orders[i], ".rdata")
+    
+    print(paste("Working on", fit_out_file))
+    
+    pValues <- list()  # list of pvalues for posterior predictive checks
+    if(is.null(X_mats)) {
+      # X <- do.call(polym,c(as.list(df[, Xs]),degree=orders[i], raw=TRUE))
+      # X <- cbind(1, X)
+      X[[i]] <- genModelMatrix(df, order=orders[i])
+    }
+    P <- ncol(X[[i]])  # number of predictors
+    
+    # Write model matrix to file
+    write.csv(X[[i]], file=paste0(full_prefix, "model_matrix_order_", orders[i], ".csv"))
+    
+    fit <- stan(..., 
+                file = stan_file,
+                data = c(list(N=N, P=P, y=df$Y, X=X[[i]]),params),
+                iter = iters[i])
+    
+    save(fit, file = fit_out_file) # save the fit data to disk
+    
+    # Compute leave one out cross-validation score (LOO)
+    log_lik <- extract_log_lik(fit)
+    loo_vals[[formName(orders[i])]] <- loo(log_lik)
+    
+    
+    post.samples <- rstan::extract(fit)  # posterior samples
+    
+    # Get the posterior modes for the parameters
+    post.modes <- list()
+    for (param in fit_pars) {
+      post.modes[[param]] <- get.Modes(file_dir = kde_pix_prefix, 
+                                       dat = post.samples, 
+                                       param = param)
+      write.csv(post.modes[[param]],
+                file = paste0(full_prefix, 
+                              param, "_post_mode_order_", orders[i], ".csv"))
+    }
+    
+    y_rep <- post.samples$y_rep  # posterior replications
+    
+    # Generate the posterior predictive check density plot
+    bayesplot::color_scheme_set("brightblue")
+    plt1 <- bayesplot::ppc_dens_overlay(df$Y, y_rep[1:NUM_REPL, ]) + 
+      coord_cartesian(xlim=c(2*min(df$Y), 2*max(df$Y)))
+    ggsave(filename = paste0(full_prefix, "dens_overlay_order_", orders[i], ".png"),
+           plot = plt1)
+    
+    # Make plot of the T = mean
+    plt2 <- bayesplot::ppc_stat(df$Y, y_rep, stat="mean")
+    ggsave(filename = paste0(full_prefix,"mean_order_", orders[i], ".png"), plot = plt2)
+    
+    # Make plot of the T = median
+    plt3 <- bayesplot::ppc_stat(df$Y, y_rep, stat="median")
+    ggsave(filename = paste0(full_prefix, "median_order_", orders[i], ".png"), plot = plt3)
+    
+    # Make scatter plot of y vs. average y_rep
+    plt4 <- bayesplot::ppc_scatter_avg(y=df$Y, yrep=y_rep[1:NUM_REPL, ])
+    ggsave(filename = paste0(full_prefix, "scatter_avg_order_", orders[i], ".png"),
+           plot = plt4)
+    
+    # Make an error scatter plot
+    plt5 <- bayesplot::ppc_error_scatter_avg(y=df$Y, yrep=y_rep[1:NUM_REPL, ])
+    ggsave(filename = paste0(full_prefix, "error_scatter_avg_order_", orders[i], ".png"),
+           plot = plt5)
+    
+    # Plot credible intervals of the parameters
+    plt6 <- rstan::plot(fit, pars=fit_pars)
+    ggsave(filename = paste0(full_prefix, "coefs_order_", orders[i], ".png"),
+           plot = plt6)
+    
+    # Plot the loo shape parameter
+    png(filename = paste0(full_prefix, "loo_k_order_", orders[i], ".png"))
+    plot(loo_vals[[i]], label_points = TRUE)
+    dev.off()
+    
+    # Save a summary dataframe of the fit
+    summary_df <- as.data.frame(summary(fit,fit_pars,
+                                        probs=c(0.025, 0.50, 0.975)
+                                        )$summary
+                                )
+    CI.Contains.0 <- ((summary_df["2.5%"]<0) & (summary_df["97.5%"]>0))
+    stat_sig_betas <- !CI.Contains.0[grep("beta", rownames(CI.Contains.0))]
+    summary_df$CI.Contains.0 <- CI.Contains.0
+    Rhat.greater.than.1.1 <- summary_df$Rhat > 1.1
+    summary_df$Rhat.greater.than.1.1 <- Rhat.greater.than.1.1
+    write.csv(summary_df, file = paste0(full_prefix, "data_summary_order_", orders[i], ".csv"))
+    write.csv(summary_df[Rhat.greater.than.1.1, ], 
+              file = paste0(full_prefix, "coeffs_Rhat_greater_than_1.1_order_", orders[i], ".csv"))
+    save(summary_df, file = paste0(full_prefix, "data_summary_order_", orders[i], ".rdata"))
+    stat_sig_summary <- summary_df[!summary_df$CI.Contains.0, ]
+    stat_sig_summary$CI.Contains.0 <- NULL
+    
+    
+    #pValues[['mean']] <- mean(mean(y))
+    
+    model_results[[formName(orders[i])]] <- list(
+      loo_val=loo_vals[[i]],
+      summary_df=summary_df,
+      stat_sig_summary=stat_sig_summary,
+      stat_sig_betas=stat_sig_betas,
+      post_modes <- post.modes,
+      fit=fit,
+      model_terms = colnames(X[[i]])
+      )
+    
+    # Write out the LOO values to a CSV to see which are above 0.7
+    loo_val.df <- as.data.frame(loo_vals[[i]]$pointwise)
+    loo_val.df$greater_than_0.7 <- loo_val.df$p_loo > 0.7
+    write.csv(loo_val.df, file = paste0(full_prefix, "loo_vals_order_", orders[i], ".csv"))
+    if(length(loo_val.df$greater_than_0.7) > 0) {
+      write.csv(loo_val.df[loo_val.df$greater_than_0.7, ], 
+                file = paste0(full_prefix, "loo_vals_above_0.7_order", orders[i], ".csv"))
+    }
+    
+  }
+  # Store the LOOCV metrics for all fits
+  save(loo_vals, file=paste0(sum_file_prefix, "_loos.rdata"))
+  # loo_vals.df <- plyr::ldply(loo_vals, data.frame)
+  # write.csv(loo_vals.df, file=paste0(sum_file_prefix, "_loos.csv"))
+  
+  # Store the LOOCV model comparison
+  if (length(orders) > 1) {
+    compare_loos <- compare(x = loo_vals)
+    if(length(orders) > 2) {
+      rownames(compare_loos) <- rev(sapply(orders, function(x){formName(x)}))
+    }
+    model_results[["compare_loos"]] <- compare_loos
+    save(compare_loos, file=paste0(sum_file_prefix, "_compare_loos.rdata"))
+    compare_loos.df <- plyr::ldply(compare_loos, data.frame)
+    write.csv(compare_loos.df, file=paste0(sum_file_prefix, "_compare_loos.csv"))
+  }
+  return(model_results)
+}
+
+
+# Function to sample replications from a Stan Model
+stan_replications <- function(stan_fit, nreps) {
+  samps <- extract(fit)
+  #yrep <- matrix(NA, nrow=)
+  
+}
